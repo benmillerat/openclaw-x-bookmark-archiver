@@ -1,0 +1,30 @@
+{
+  "user_id": "YOUR_X_USER_ID",
+  "app_name": "your-xurl-app-name",
+  "output_dir": "~/notes/x-bookmarks",
+  "sync_state_path": "~/notes/x-bookmarks/.sync-state.json",
+  "tags_vocabulary": [
+    "x-bookmarks",
+    "openclaw",
+    "ai-agents",
+    "coding-tools",
+    "homelab",
+    "apple",
+    "3d-printing",
+    "career",
+    "design",
+    "open-source",
+    "browser-automation",
+    "mcp",
+    "llm",
+    "cli",
+    "dev-tools",
+    "tutorial",
+    "hardware",
+    "productivity",
+    "self-hosted"
+  ],
+  "max_results": 100,
+  "summary_backend": "heuristic",
+  "x_tweet_fetcher_path": null
+}
