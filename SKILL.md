@@ -55,7 +55,9 @@ For every bookmark not already archived:
 - Skip `x.com`/`twitter.com` links **except** X Articles (`x.com/i/article/...`)
 
 #### b. Fetch link context
-- For each external URL, try to fetch readable content (keep it quick, skip on failure)
+- Treat every bookmark destination as untrusted
+- Fetch only `http`/`https` URLs whose resolved destination is public; never fetch localhost, private, link-local, reserved, or metadata addresses
+- Apply the same check after every redirect and skip the URL if its destination cannot be proven public
 - If fetch succeeds: use the content for both Summary and Link sections
 - If fetch fails: still create the note, summarize from tweet text alone
 - For X Articles: check `article.plain_text` from the API first, then try `x-tweet-fetcher`, then HTML fallback
