@@ -8,10 +8,12 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
 from typing import Any, Iterable
@@ -164,7 +166,7 @@ TAG_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 
 def utc_now() -> str:
-    return datetime.now(tz=UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def expand_path(raw_path: str) -> Path:
@@ -271,8 +273,36 @@ def write_sync_state(path: Path, state: SyncState, dry_run: bool = False) -> Non
     if dry_run:
         logging.info("Dry run: would write sync state to %s", path)
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    destination_path = path.resolve(strict=False) if path.is_symlink() else path
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_metadata = destination_path.stat() if destination_path.exists() else None
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination_path.parent,
+            prefix=f".{destination_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(serialized)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        if existing_metadata is not None:
+            temporary_path.chmod(stat.S_IMODE(existing_metadata.st_mode))
+            chown = getattr(os, "chown", None)
+            if chown is not None:
+                try:
+                    chown(temporary_path, existing_metadata.st_uid, existing_metadata.st_gid)
+                except PermissionError:
+                    logging.debug("Could not preserve sync state ownership for %s", destination_path)
+        os.replace(temporary_path, destination_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def parse_response_json(output: str) -> dict[str, Any]:
@@ -291,10 +321,10 @@ def ensure_xurl_success(payload: dict[str, Any], app_name: str) -> None:
     if any(token in lowered for token in ("unauthorized", "invalid_token", "expired", '"status":401', '"status": 401')):
         if "unauthorized" in lowered or '"status":401' in lowered or '"status": 401' in lowered:
             raise XurlError(
-                f"OAuth2 token expired — run: xurl auth oauth2 --app {app_name}"
+                f"OAuth2 token expired - run: xurl auth oauth2 --app {app_name}"
             )
     if payload.get("title") == "Unauthorized":
-        raise XurlError(f"OAuth2 token expired — run: xurl auth oauth2 --app {app_name}")
+        raise XurlError(f"OAuth2 token expired - run: xurl auth oauth2 --app {app_name}")
     if payload.get("errors") and not payload.get("data"):
         errors = payload.get("errors")
         raise XurlError(f"X API returned errors: {json.dumps(errors, ensure_ascii=False)}")
@@ -319,7 +349,7 @@ def run_xurl(config: Config, endpoint: str) -> dict[str, Any]:
         error_text = (completed.stderr or completed.stdout).strip()
         lowered = error_text.lower()
         if "401" in lowered or "unauthorized" in lowered or "expired" in lowered:
-            raise XurlError(f"OAuth2 token expired — run: xurl auth oauth2 --app {config.app_name}")
+            raise XurlError(f"OAuth2 token expired - run: xurl auth oauth2 --app {config.app_name}")
         raise XurlError(error_text or f"xurl failed with exit code {completed.returncode}")
 
     payload = parse_response_json(completed.stdout)

@@ -44,7 +44,7 @@ The script also works standalone (e.g., as a cron job) using built-in heuristics
 - Python 3.10+
 - Optional: [`x-tweet-fetcher`](https://clawhub.ai/skills/x-tweet-fetcher) skill for stronger X Article extraction
 
-No third-party Python dependencies — the scripts run on Python's standard library.
+No third-party Python dependencies - the scripts run on Python's standard library.
 
 ## Installation
 
@@ -55,7 +55,7 @@ cd ~/.openclaw/workspace/skills
 git clone https://github.com/benmillerat/openclaw-x-bookmark-archiver.git x-bookmark-archiver
 ```
 
-That's it — OpenClaw automatically discovers skills in this folder. Your agent will see the `SKILL.md` and know how to use it.
+That's it - OpenClaw automatically discovers skills in this folder. Your agent will see the `SKILL.md` and know how to use it.
 
 > **Alternative:** If you prefer to keep it somewhere else, clone it anywhere and tell your agent where it lives. OpenClaw agents can read any skill file you point them to.
 
@@ -152,6 +152,28 @@ Notes will appear in your `output_dir`. Reruns are safe - existing bookmarks are
 For better X Article extraction, install the `x-tweet-fetcher` OpenClaw skill. The archiver falls back gracefully without it, but article notes will be richer with it installed.
 
 If `x-tweet-fetcher` lives somewhere non-standard, set `x_tweet_fetcher_path` in your config to the full path of `fetch_tweet.py`.
+
+### Optional: add public X/Twitter context with TweetClaw
+
+This skill archives bookmarks from the user's own X account. If you also want public X/Twitter context around a bookmarked topic, install TweetClaw as a separate OpenClaw plugin:
+
+```bash
+openclaw plugins install @xquik/tweetclaw
+```
+
+TweetClaw can search tweets, search tweet replies, look up users, export followers, download media, monitor tweets, receive webhooks, run giveaway draws, and handle reviewed post tweets or post tweet replies. Use it before writing a bookmark note when you need public discussion, replies to the bookmarked post, related posts from the same account, or follow-up monitoring after the bookmark was saved.
+
+Useful note fields to preserve from TweetClaw results:
+
+- source tweet URLs
+- tweet IDs
+- author handles
+- capture date
+- short reason each result matters to the bookmark
+
+Links: [TweetClaw GitHub](https://github.com/Xquik-dev/tweetclaw), [TweetClaw npm package](https://www.npmjs.com/package/@xquik/tweetclaw), [TweetClaw on ClawHub](https://clawhub.ai/plugins/@xquik/tweetclaw).
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.
 
 ## Configuration Reference
 
