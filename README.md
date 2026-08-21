@@ -293,6 +293,19 @@ For X Articles, the helper tries these sources in order:
 
 This mirrors the production workflow closely while keeping the public package easy to configure.
 
+### Safe external fetching
+
+Bookmark destinations are untrusted. The built-in fetcher therefore:
+
+- allows only `http` and `https`
+- resolves the hostname and connects directly to its validated public IPs to prevent DNS rebinding; ambient proxy settings are not used
+- rejects loopback, private, link-local, reserved, and other non-public IPv4/IPv6 addresses
+- validates every redirect target again
+- reads at most 1 MB before extracting up to 16,000 characters
+- skips destination and AI-backend requests during `--dry-run`
+
+Unsafe or unreachable links do not stop the sync. The bookmark is still archived without fetched link context.
+
 ## Troubleshooting
 
 ### `401 Unauthorized` on bookmark sync

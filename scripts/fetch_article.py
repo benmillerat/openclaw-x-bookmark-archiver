@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
+import ssl
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from html import unescape
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import SplitResult, urljoin, urlsplit
 
 
 DEFAULT_USER_AGENT = (
@@ -20,6 +23,82 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/123.0.0.0 Safari/537.36 x-bookmark-archiver/1.0"
 )
+ALLOWED_URL_SCHEMES = {"http", "https"}
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+DEFAULT_MAX_REDIRECTS = 5
+DEFAULT_MAX_RESPONSE_BYTES = 1_000_000
+
+
+class SafeFetchError(Exception):
+    """A URL could not be fetched without crossing the public-web boundary."""
+
+
+@dataclass(slots=True)
+class _HTTPResponseData:
+    status: int
+    reason: str
+    headers: http.client.HTTPMessage
+    body: bytes
+
+
+def _connect_to_validated_ip(
+    connection: http.client.HTTPConnection,
+    connect_ips: tuple[str, ...],
+) -> socket.socket:
+    """Try each validated public address without performing another DNS lookup."""
+
+    last_error: OSError | None = None
+    for connect_ip in connect_ips:
+        try:
+            return connection._create_connection(
+                (connect_ip, connection.port),
+                connection.timeout,
+                connection.source_address,
+            )
+        except OSError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise SafeFetchError("URL host has no validated public IP address")
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Connect to the public IP that was validated for the original hostname."""
+
+    def __init__(
+        self,
+        host: str,
+        connect_ips: tuple[str, ...],
+        port: int,
+        timeout: int,
+    ) -> None:
+        self._connect_ips = connect_ips
+        super().__init__(host, port=port, timeout=timeout)
+
+    def connect(self) -> None:
+        # Pinning prevents a second DNS lookup from rebinding the hostname to
+        # localhost or a private address after validation.
+        self.sock = _connect_to_validated_ip(self, self._connect_ips)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Use a validated IP while keeping the hostname for TLS verification."""
+
+    def __init__(
+        self,
+        host: str,
+        connect_ips: tuple[str, ...],
+        port: int,
+        timeout: int,
+    ) -> None:
+        self._connect_ips = connect_ips
+        super().__init__(host, port=port, timeout=timeout)
+
+    def connect(self) -> None:
+        self.sock = _connect_to_validated_ip(self, self._connect_ips)
+        # Certificate validation and SNI must use the original hostname, not
+        # the pinned numeric address.
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
 @dataclass(slots=True)
@@ -128,29 +207,247 @@ def extract_main_text(html_text: str) -> tuple[str | None, str]:
     return title, text
 
 
+def _normalized_ip_address(raw_address: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Normalize IPv6 zone identifiers and IPv4-mapped IPv6 addresses."""
+
+    address = ipaddress.ip_address(raw_address.split("%", 1)[0])
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        return address.ipv4_mapped
+    return address
+
+
+def _is_public_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return true only for addresses intended to be globally reachable."""
+
+    is_site_local = isinstance(address, ipaddress.IPv6Address) and address.is_site_local
+    return address.is_global and not any(
+        (
+            address.is_private,
+            address.is_loopback,
+            address.is_link_local,
+            address.is_multicast,
+            address.is_reserved,
+            address.is_unspecified,
+            is_site_local,
+        )
+    )
+
+
+def _network_hostname(hostname: str) -> str:
+    """Keep numeric IPs intact and encode international hostnames for DNS/TLS."""
+
+    try:
+        _normalized_ip_address(hostname)
+    except ValueError:
+        try:
+            return hostname.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise SafeFetchError(f"Invalid URL hostname: {hostname}") from exc
+    return hostname
+
+
+def _resolve_public_ips(hostname: str, port: int) -> tuple[str, ...]:
+    # Validate numeric hosts directly. They must not be reinterpreted through
+    # DNS, which also makes the decision independent of resolver behavior.
+    try:
+        literal_address = _normalized_ip_address(hostname)
+    except ValueError:
+        literal_address = None
+    if literal_address is not None:
+        if not _is_public_ip(literal_address):
+            raise SafeFetchError(
+                f"Blocked non-public URL address for {hostname}: {literal_address}"
+            )
+        return (str(literal_address),)
+
+    try:
+        answers = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise SafeFetchError(f"Unable to resolve URL host: {hostname}") from exc
+
+    if not answers:
+        raise SafeFetchError(f"URL host has no network address: {hostname}")
+
+    public_addresses: list[str] = []
+    for answer in answers:
+        raw_address = str(answer[4][0])
+        try:
+            address = _normalized_ip_address(raw_address)
+        except ValueError as exc:
+            raise SafeFetchError(f"URL host resolved to an invalid IP address: {raw_address}") from exc
+
+        # is_global excludes loopback, RFC1918/unique-local, link-local,
+        # shared, multicast, unspecified, reserved, and metadata addresses.
+        if not _is_public_ip(address):
+            raise SafeFetchError(
+                f"Blocked non-public URL address for {hostname}: {address}"
+            )
+        normalized = str(address)
+        if normalized not in public_addresses:
+            public_addresses.append(normalized)
+
+    return tuple(public_addresses)
+
+
+def _validate_public_url(url: str) -> tuple[SplitResult, str, tuple[str, ...], int]:
+    if not isinstance(url, str) or not url.strip():
+        raise SafeFetchError("URL must be a non-empty string")
+    if any(ord(character) < 32 or ord(character) == 127 for character in url):
+        raise SafeFetchError("URL contains control characters")
+
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise SafeFetchError(f"Invalid URL: {exc}") from exc
+
+    scheme = parsed.scheme.lower()
+    if scheme not in ALLOWED_URL_SCHEMES:
+        raise SafeFetchError(
+            f"Blocked URL scheme '{scheme or '(missing)'}'; only http and https are allowed"
+        )
+    if not hostname:
+        raise SafeFetchError("URL must include a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise SafeFetchError("URLs containing credentials are not allowed")
+
+    port = explicit_port or (443 if scheme == "https" else 80)
+    if not 1 <= port <= 65_535:
+        raise SafeFetchError(f"Invalid URL port: {port}")
+
+    normalized_hostname = _network_hostname(hostname)
+    connect_ips = _resolve_public_ips(normalized_hostname, port)
+    return parsed, normalized_hostname, connect_ips, port
+
+
+def _request_once(
+    parsed: SplitResult,
+    hostname: str,
+    connect_ips: tuple[str, ...],
+    port: int,
+    *,
+    timeout_seconds: int,
+    max_response_bytes: int,
+) -> _HTTPResponseData:
+    connection_class = (
+        _PinnedHTTPSConnection if parsed.scheme.lower() == "https" else _PinnedHTTPConnection
+    )
+    connection = connection_class(
+        hostname,
+        connect_ips,
+        port,
+        timeout_seconds,
+    )
+    response: http.client.HTTPResponse | None = None
+    try:
+        request_target = parsed.path or "/"
+        if parsed.query:
+            request_target = f"{request_target}?{parsed.query}"
+        connection.request(
+            "GET",
+            request_target,
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        response = connection.getresponse()
+
+        # Redirect bodies are irrelevant; the Location target is validated as
+        # a fresh URL by fetch_readable_url before another connection is made.
+        if response.status in REDIRECT_STATUS_CODES:
+            return _HTTPResponseData(
+                status=response.status,
+                reason=response.reason or "",
+                headers=response.headers,
+                body=b"",
+            )
+
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                declared_size = 0
+            if declared_size > max_response_bytes:
+                raise SafeFetchError(
+                    f"Response exceeds maximum size of {max_response_bytes} bytes"
+                )
+
+        body = response.read(max_response_bytes + 1)
+        if len(body) > max_response_bytes:
+            raise SafeFetchError(
+                f"Response exceeds maximum size of {max_response_bytes} bytes"
+            )
+        return _HTTPResponseData(
+            status=response.status,
+            reason=response.reason or "",
+            headers=response.headers,
+            body=body,
+        )
+    finally:
+        if response is not None:
+            response.close()
+        connection.close()
+
+
 def fetch_readable_url(
     url: str,
     *,
     timeout_seconds: int = 20,
     max_chars: int = 16_000,
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    max_redirects: int = DEFAULT_MAX_REDIRECTS,
 ) -> FetchResult:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    )
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            content_type = (response.headers.get("content-type") or "").lower()
-            charset = response.headers.get_content_charset() or "utf-8"
-            payload = response.read().decode(charset, errors="replace")
-    except HTTPError as exc:
-        return FetchResult(ok=False, source="web_fetch_fallback", url=url, error=f"HTTP {exc.code}: {exc.reason}")
-    except URLError as exc:
-        return FetchResult(ok=False, source="web_fetch_fallback", url=url, error=str(exc.reason))
-    except OSError as exc:
+        if max_chars < 1:
+            raise SafeFetchError("max_chars must be positive")
+        if max_response_bytes < 1:
+            raise SafeFetchError("max_response_bytes must be positive")
+        if max_redirects < 0:
+            raise SafeFetchError("max_redirects cannot be negative")
+
+        current_url = url
+        visited_urls: set[str] = set()
+        response_data: _HTTPResponseData | None = None
+
+        for redirect_count in range(max_redirects + 1):
+            if current_url in visited_urls:
+                raise SafeFetchError("Redirect loop detected")
+            visited_urls.add(current_url)
+
+            parsed, hostname, connect_ips, port = _validate_public_url(current_url)
+            response_data = _request_once(
+                parsed,
+                hostname,
+                connect_ips,
+                port,
+                timeout_seconds=timeout_seconds,
+                max_response_bytes=max_response_bytes,
+            )
+
+            if response_data.status not in REDIRECT_STATUS_CODES:
+                break
+
+            location = response_data.headers.get("location")
+            if not location:
+                raise SafeFetchError(
+                    f"HTTP {response_data.status} redirect did not include a Location header"
+                )
+            if redirect_count >= max_redirects:
+                raise SafeFetchError(f"Too many redirects; maximum is {max_redirects}")
+            current_url = urljoin(current_url, location)
+
+        if response_data is None:
+            raise SafeFetchError("No HTTP response received")
+        if not 200 <= response_data.status < 300:
+            raise SafeFetchError(f"HTTP {response_data.status}: {response_data.reason}")
+
+        content_type = (response_data.headers.get("content-type") or "").lower()
+        charset = response_data.headers.get_content_charset() or "utf-8"
+        payload = response_data.body.decode(charset, errors="replace")
+    except (SafeFetchError, OSError, http.client.HTTPException, ssl.SSLError) as exc:
         return FetchResult(ok=False, source="web_fetch_fallback", url=url, error=str(exc))
 
     title: str | None = None

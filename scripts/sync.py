@@ -1048,6 +1048,13 @@ def process_bookmark(
         logging.info("Skipping %s; note already exists at %s", bookmark.tweet_id, existing_notes[bookmark.tweet_id])
         return None
 
+    if dry_run:
+        # A dry run reports what would be archived without contacting any URL
+        # contained in untrusted bookmark content or invoking an AI backend.
+        destination = output_dir / f"dry-run-{bookmark.tweet_id}.md"
+        logging.info("Dry run: would archive bookmark %s", bookmark.tweet_id)
+        return destination
+
     article: ArticleExtraction | None = None
     if bookmark.article_url:
         article = extract_article(
@@ -1063,10 +1070,6 @@ def process_bookmark(
     generated = generate_content(bookmark, link_results, article, config)
     note_markdown = build_note_markdown(bookmark, generated, article)
     destination = next_available_path(output_dir, generated.title, bookmark.display_name or f"@{bookmark.username}")
-
-    if dry_run:
-        logging.info("Dry run: would write %s", destination)
-        return destination
 
     output_dir.mkdir(parents=True, exist_ok=True)
     destination.write_text(note_markdown, encoding="utf-8")
@@ -1103,7 +1106,8 @@ def main() -> int:
         if args.summary_backend:
             config.summary_backend = args.summary_backend
 
-        config.output_dir.mkdir(parents=True, exist_ok=True)
+        if not args.dry_run:
+            config.output_dir.mkdir(parents=True, exist_ok=True)
         state = load_sync_state(config.sync_state_path)
         existing_notes = scan_existing_notes(config.output_dir)
         bookmarks, newest_id = fetch_new_bookmarks(config, state.last_id)
